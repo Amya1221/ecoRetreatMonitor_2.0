@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 API = 'https://admin.bookodisha.com/api/auth/hotel_details'
-HOTELS = {'37': 'Konark', '41': 'Satkosia', '43': 'Sonapur'}
+DEFAULT_HOTELS = {'37': 'Konark', '41': 'Satkosia', '43': 'Sonapur'}
 FIRST_DATE = date(2026, 11, 1)
 LAST_DATE = date(2027, 3, 1)  # inclusive CHECK-IN dates
 STATE_FILE = Path('state.json')
@@ -34,15 +34,27 @@ SESSION.headers.update({
 })
 
 
-def checkin_dates():
-    day = max(FIRST_DATE, datetime.now(IST).date())
-    while day <= LAST_DATE:
-        yield day
-        day += timedelta(days=1)
+def checkin_dates(state):
+    today = datetime.now(IST).date()
+    if state['date_mode'] == 'selected':
+        for value in sorted(set(state['selected_dates'])):
+            day = date.fromisoformat(value)
+            if day >= today:
+                yield day
+    else:
+        day = max(date.fromisoformat(state['range_start']), today)
+        end = date.fromisoformat(state['range_end'])
+        while day <= end:
+            yield day
+            day += timedelta(days=1)
 
 
 def fresh_state():
     return {'rooms': {}, 'pending': {}, 'last_summary': None,
+            'hotels': DEFAULT_HOTELS.copy(), 'selected_hotels': list(DEFAULT_HOTELS),
+            'date_mode': 'range', 'range_start': FIRST_DATE.isoformat(),
+            'range_end': LAST_DATE.isoformat(), 'selected_dates': [],
+            'paused': False, 'telegram_offset': 0,
             'runs': 0, 'failed_checks': 0, 'alerts': 0,
             'last_run': None, 'scan_offset': 0}
 
@@ -56,6 +68,8 @@ def load_state():
         raise ValueError('Bad state.json; refusing to overwrite it')
     for k, v in fresh_state().items():
         data.setdefault(k, v)
+    if not isinstance(data['hotels'], dict) or not isinstance(data['selected_hotels'], list):
+        raise ValueError('Invalid persisted hotel configuration')
     return data
 
 
@@ -104,7 +118,7 @@ def status_is_available(value):
     return normalized == expected
 
 
-def fetch(hotel, day):
+def fetch(hotel, location, day):
     date_text = day.isoformat()
     payload = {
         'request_type': 'check_room_availability',
@@ -142,7 +156,7 @@ def fetch(hotel, day):
                 key = f'{hotel}|{date_text}|{room["id"]}'
                 results[key] = {
                     'available': status_is_available(room.get('booking_status')),
-                    'location': HOTELS[hotel], 'date': date_text,
+                    'location': location, 'date': date_text,
                     'room': str(room.get('title', 'Unknown')),
                     'price': str(room.get('price', 'Unknown')),
                     'qty': str(room.get('quantity', 'Unknown')),
@@ -169,12 +183,146 @@ def alert(room):
             'Verify on the booking website; API status is not a confirmed reservation.')
 
 
+# Telegram is polled on each scheduled run. Only the configured private chat
+# may change settings. Do not use getUpdates concurrently with a webhook.
+def valid_date(value):
+    parsed = date.fromisoformat(value)
+    if not (date(2026, 1, 1) <= parsed <= date(2030, 12, 31)):
+        raise ValueError('Date must be within 2026–2030')
+    return parsed
+
+
+def describe(state):
+    hotels = ', '.join(f'{h}: {state["hotels"][h]}' for h in state['selected_hotels']) or '(none)'
+    if state['date_mode'] == 'range':
+        dates = f'{state["range_start"]} to {state["range_end"]}'
+    else:
+        dates = ', '.join(state['selected_dates']) or '(none)'
+    return ('📋 <b>Monitor configuration</b>\n'
+            f'Hotels: {html.escape(hotels)}\n'
+            f'Dates: {html.escape(dates)}\n'
+            f'Paused: {state["paused"]}\n'
+            'Changes are applied during the next scheduled workflow run.')
+
+
+HELP = ('Commands:\n/range 2026-11-01 2027-03-01 — inclusive range\n/dates 2026-12-22 2026-12-23 — replace with selected dates\n/add 2026-12-24 — add a date (switches to selected mode)\n/remove 2026-12-24 — remove date (switches to selected mode)\n/hotels — list known and active hotels\n/hoteladd 55 My Hotel — register ID and name, enable it\n/hotelremove 55 — disable and remove a hotel ID\n/hotelselect 37 41 55 — enable only these registered IDs\n/status — current settings\n/pause /resume — stop/start checks\n/check — request checks on this scheduled run\n/help — show commands\nCommands are read by the next GitHub Actions run; no instant execution.')
+
+
+def process_command(state, message):
+    parts = message.strip().split()
+    if not parts:
+        return None
+    cmd = parts[0].split('@')[0].lower()
+    args = parts[1:]
+    if cmd in ('/help', '/start'):
+        return html.escape(HELP)
+    if cmd == '/status':
+        return describe(state)
+    if cmd == '/hotels':
+        return ('🏨 <b>Registered hotels</b>\n' + '\n'.join(
+            f'{"✅" if h in state["selected_hotels"] else "▫️"} {html.escape(h)} — {html.escape(name)}'
+            for h, name in sorted(state['hotels'].items())))
+    if cmd == '/range':
+        if len(args) != 2:
+            raise ValueError('Use /range YYYY-MM-DD YYYY-MM-DD')
+        start, end = map(valid_date, args)
+        if start > end or (end - start).days > 365:
+            raise ValueError('Range must be ordered and at most 366 days inclusive')
+        state.update(date_mode='range', range_start=start.isoformat(), range_end=end.isoformat())
+    elif cmd == '/dates':
+        if not 1 <= len(args) <= 366:
+            raise ValueError('Provide 1–366 dates: /dates YYYY-MM-DD ...')
+        state.update(date_mode='selected', selected_dates=sorted({valid_date(a).isoformat() for a in args}))
+    elif cmd in ('/add', '/remove'):
+        if len(args) != 1:
+            raise ValueError(f'Use {cmd} YYYY-MM-DD')
+        value = valid_date(args[0]).isoformat()
+        dates = set(state['selected_dates']) if state['date_mode'] == 'selected' else {
+            (date.fromisoformat(state['range_start']) + timedelta(days=i)).isoformat()
+            for i in range((date.fromisoformat(state['range_end']) - date.fromisoformat(state['range_start'])).days + 1)
+        }
+        if cmd == '/add':
+            dates.add(value)
+        else:
+            dates.discard(value)
+        state.update(date_mode='selected', selected_dates=sorted(dates))
+    elif cmd == '/hoteladd':
+        if len(args) < 2 or not args[0].isdigit() or not 1 <= len(args[0]) <= 12:
+            raise ValueError('Use /hoteladd 55 Hotel Name (numeric ID + name)')
+        hotel_id, name = args[0], ' '.join(args[1:]).strip()
+        if len(name) > 80:
+            raise ValueError('Hotel name maximum 80 characters')
+        state['hotels'][hotel_id] = name
+        if hotel_id not in state['selected_hotels']:
+            state['selected_hotels'].append(hotel_id)
+    elif cmd == '/hotelremove':
+        if len(args) != 1 or args[0] not in state['hotels']:
+            raise ValueError('Use /hotelremove ID with a registered hotel ID')
+        hotel_id = args[0]
+        state['hotels'].pop(hotel_id)
+        state['selected_hotels'] = [h for h in state['selected_hotels'] if h != hotel_id]
+    elif cmd == '/hotelselect':
+        if not args or len(args) != len(set(args)):
+            raise ValueError('Use /hotelselect 37 41 (distinct registered IDs)')
+        unknown = [h for h in args if h not in state['hotels']]
+        if unknown:
+            raise ValueError('Unknown hotel ID(s): ' + ', '.join(unknown) + '. Register with /hoteladd ID Name')
+        state['selected_hotels'] = args
+    elif cmd == '/pause':
+        state['paused'] = True
+    elif cmd == '/resume':
+        state['paused'] = False
+    elif cmd == '/check':
+        state['paused'] = False
+    else:
+        return 'Unknown command. Send /help.'
+    return '✅ Settings updated.\n' + describe(state)
+
+
+def poll_commands(state):
+    endpoint = f'https://api.telegram.org/bot{TOKEN}/getUpdates'
+    try:
+        response = SESSION.get(endpoint, params={
+            'offset': int(state['telegram_offset']) + 1,
+            'timeout': 0, 'limit': 100,
+            'allowed_updates': json.dumps(['message']),
+        }, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get('ok') or not isinstance(payload.get('result'), list):
+            raise ValueError('Unexpected Telegram getUpdates response')
+    except (requests.RequestException, ValueError) as exc:
+        logging.warning('Telegram command polling failed: %s', exc)
+        return
+    for update in payload['result']:
+        uid = update.get('update_id')
+        if not isinstance(uid, int):
+            continue
+        message = update.get('message') or {}
+        chat_id = str((message.get('chat') or {}).get('id', ''))
+        user_id = str((message.get('from') or {}).get('id', ''))
+        text = message.get('text', '')
+        # Only permit commands from the intended private owner chat.
+        if chat_id == str(CHAT_ID) and user_id == str(CHAT_ID) and text.startswith('/'):
+            try:
+                reply = process_command(state, text)
+            except (ValueError, OverflowError) as exc:
+                reply = '❌ ' + html.escape(str(exc))
+            save_state(state)  # persist updated config before acknowledging
+            if reply:
+                send(reply)
+        state['telegram_offset'] = max(int(state['telegram_offset']), uid)
+        save_state(state)
+
 def main():
     state = load_state()
+    poll_commands(state)
     start = time.monotonic()
     now = datetime.now(IST)
-    jobs = [(h, day) for h in HOTELS for day in checkin_dates()]
-    jobs.sort(key=lambda x: (x[1], x[0]))
+    jobs = ([] if state['paused'] else [(h, state['hotels'][h], day)
+            for h in state['selected_hotels'] for day in checkin_dates(state)
+            if h in state['hotels']])
+    jobs.sort(key=lambda x: (x[2], x[0]))
     total = len(jobs)
     success = failure = alerts = observed = checked = 0
     if total:
@@ -183,11 +331,11 @@ def main():
     else:
         offset = 0
 
-    for hotel, day in jobs:
+    for hotel, location, day in jobs:
         if time.monotonic() - start > RUN_BUDGET:
             logging.warning('Run budget reached; remaining dates will be prioritized next run')
             break
-        current = fetch(hotel, day)
+        current = fetch(hotel, location, day)
         checked += 1
         if current is None:
             failure += 1
@@ -226,7 +374,7 @@ def main():
               f'🚨 New alerts: {alerts}\n'
               + ('⚠️ Partial scan; continuing on next run.' if checked < total else ''))
     if HEARTBEAT:
-        send(status)
+        send(status + ('\n⏸ Monitoring paused.' if state['paused'] else ''))
     if now.hour >= SUMMARY_HOUR and state['last_summary'] != now.date().isoformat():
         summary = ('📊 <b>Eco Retreat daily summary</b>\n'
                    f'📅 {now:%d %b %Y}\n'
