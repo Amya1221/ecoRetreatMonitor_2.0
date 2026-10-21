@@ -32,7 +32,8 @@ jobs:
           HEARTBEAT_EVERY_RUN: '1'
           DAILY_SUMMARY_HOUR_IST: '20'
           REQUEST_DELAY_SECONDS: '0.25'
-          RUN_BUDGET_SECONDS: '480'
+          RUN_BUDGET_SECONDS: '240'
+          MAX_CHECKS_PER_RUN: '30'
         run: python monitor.py
       - name: Persist state
         if: always() && hashFiles('state.json') != ''

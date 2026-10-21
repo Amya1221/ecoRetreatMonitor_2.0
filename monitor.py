@@ -22,7 +22,8 @@ AVAILABLE_VALUE = os.getenv('AVAILABLE_STATUS', '1').strip().lower()
 HEARTBEAT = os.getenv('HEARTBEAT_EVERY_RUN', '1') == '1'
 SUMMARY_HOUR = int(os.getenv('DAILY_SUMMARY_HOUR_IST', '20'))
 DELAY = float(os.getenv('REQUEST_DELAY_SECONDS', '0.25'))
-RUN_BUDGET = float(os.getenv('RUN_BUDGET_SECONDS', '480'))
+RUN_BUDGET = float(os.getenv('RUN_BUDGET_SECONDS', '240'))
+MAX_CHECKS = int(os.getenv('MAX_CHECKS_PER_RUN', '30'))
 DEBUG_API = os.getenv('DEBUG_API_RESPONSE', '0') == '1'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -54,7 +55,7 @@ def fresh_state():
             'hotels': DEFAULT_HOTELS.copy(), 'selected_hotels': list(DEFAULT_HOTELS),
             'date_mode': 'range', 'range_start': FIRST_DATE.isoformat(),
             'range_end': LAST_DATE.isoformat(), 'selected_dates': [],
-            'paused': False, 'telegram_offset': 0,
+            'paused': True, 'one_shot': False, 'telegram_offset': 0,
             'runs': 0, 'failed_checks': 0, 'alerts': 0,
             'last_run': None, 'scan_offset': 0}
 
@@ -201,11 +202,11 @@ def describe(state):
     return ('📋 <b>Monitor configuration</b>\n'
             f'Hotels: {html.escape(hotels)}\n'
             f'Dates: {html.escape(dates)}\n'
-            f'Paused: {state["paused"]}\n'
+            f'Monitor: {"STOPPED" if state["paused"] else "RUNNING"}\n'
             'Changes are applied during the next scheduled workflow run.')
 
 
-HELP = ('Commands:\n/range 2026-11-01 2027-03-01 — inclusive range\n/dates 2026-12-22 2026-12-23 — replace with selected dates\n/add 2026-12-24 — add a date (switches to selected mode)\n/remove 2026-12-24 — remove date (switches to selected mode)\n/hotels — list known and active hotels\n/hoteladd 55 My Hotel — register ID and name, enable it\n/hotelremove 55 — disable and remove a hotel ID\n/hotelselect 37 41 55 — enable only these registered IDs\n/status — current settings\n/pause /resume — stop/start checks\n/check — request checks on this scheduled run\n/help — show commands\nCommands are read by the next GitHub Actions run; no instant execution.')
+HELP = ('Commands:\n/start — start periodic availability monitoring\n/stop — stop checks; Telegram commands remain active\n/range 2026-11-01 2027-03-01 — inclusive range\n/dates 2026-12-22 2026-12-23 — replace with selected dates\n/add 2026-12-24 — add a date (switches to selected mode)\n/remove 2026-12-24 — remove date (switches to selected mode)\n/hotels — list known and active hotels\n/hoteladd 55 My Hotel — register ID and name, enable it\n/hotelremove 55 — disable and remove a hotel ID\n/hotelselect 37 41 55 — enable only these registered IDs\n/status — current settings\n/pause /resume — aliases for /stop and /start\n/check — perform one scan batch even if stopped, without starting periodic checks\n/help — show commands\nCommands are read by the next GitHub Actions run; no instant execution.')
 
 
 def process_command(state, message):
@@ -214,7 +215,7 @@ def process_command(state, message):
         return None
     cmd = parts[0].split('@')[0].lower()
     args = parts[1:]
-    if cmd in ('/help', '/start'):
+    if cmd == '/help':
         return html.escape(HELP)
     if cmd == '/status':
         return describe(state)
@@ -268,12 +269,13 @@ def process_command(state, message):
         if unknown:
             raise ValueError('Unknown hotel ID(s): ' + ', '.join(unknown) + '. Register with /hoteladd ID Name')
         state['selected_hotels'] = args
-    elif cmd == '/pause':
+    elif cmd in ('/stop', '/pause'):
         state['paused'] = True
-    elif cmd == '/resume':
+        state['one_shot'] = False
+    elif cmd in ('/start', '/resume'):
         state['paused'] = False
     elif cmd == '/check':
-        state['paused'] = False
+        state['one_shot'] = True
     else:
         return 'Unknown command. Send /help.'
     return '✅ Settings updated.\n' + describe(state)
@@ -319,7 +321,10 @@ def main():
     poll_commands(state)
     start = time.monotonic()
     now = datetime.now(IST)
-    jobs = ([] if state['paused'] else [(h, state['hotels'][h], day)
+    one_shot = bool(state.pop('one_shot', False))
+    save_state(state)
+    scan_enabled = (not state['paused']) or one_shot
+    jobs = ([] if not scan_enabled else [(h, state['hotels'][h], day)
             for h in state['selected_hotels'] for day in checkin_dates(state)
             if h in state['hotels']])
     jobs.sort(key=lambda x: (x[2], x[0]))
@@ -332,6 +337,9 @@ def main():
         offset = 0
 
     for hotel, location, day in jobs:
+        if checked >= MAX_CHECKS:
+            logging.info('Per-run cap reached: %s checks', MAX_CHECKS)
+            break
         if time.monotonic() - start > RUN_BUDGET:
             logging.warning('Run budget reached; remaining dates will be prioritized next run')
             break
@@ -373,9 +381,9 @@ def main():
               f'🛏 Available categories observed: {observed}\n'
               f'🚨 New alerts: {alerts}\n'
               + ('⚠️ Partial scan; continuing on next run.' if checked < total else ''))
-    if HEARTBEAT:
-        send(status + ('\n⏸ Monitoring paused.' if state['paused'] else ''))
-    if now.hour >= SUMMARY_HOUR and state['last_summary'] != now.date().isoformat():
+    if HEARTBEAT and scan_enabled:
+        send(status + ('\n🔎 One-off scan (periodic monitoring remains stopped).' if state['paused'] else ''))
+    if scan_enabled and now.hour >= SUMMARY_HOUR and state['last_summary'] != now.date().isoformat():
         summary = ('📊 <b>Eco Retreat daily summary</b>\n'
                    f'📅 {now:%d %b %Y}\n'
                    f'Runs recorded (all-time): {state["runs"]}\n'
