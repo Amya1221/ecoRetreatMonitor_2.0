@@ -12,27 +12,29 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 9
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Restore previous persistent state
+        run: python -m pip install -r requirements.txt
+      - name: Restore persistent state
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python restore_state.py
-      - name: Monitor and send Telegram messages
+      - name: Run monitor
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          HEARTBEAT_EVERY_RUN: '1'
           AVAILABLE_STATUS: '1'
+          HEARTBEAT_EVERY_RUN: '1'
           DAILY_SUMMARY_HOUR_IST: '20'
+          REQUEST_DELAY_SECONDS: '0.25'
+          RUN_BUDGET_SECONDS: '480'
         run: python monitor.py
-      - name: Save persistent state for next run
+      - name: Persist state
         if: always() && hashFiles('state.json') != ''
         uses: actions/upload-artifact@v4
         with:
