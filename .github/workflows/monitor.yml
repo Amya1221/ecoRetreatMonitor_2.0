@@ -1,0 +1,42 @@
+name: Eco Retreat Monitor
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: eco-retreat-monitor
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Restore previous persistent state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python restore_state.py
+      - name: Monitor and send Telegram messages
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          HEARTBEAT_EVERY_RUN: '1'
+          AVAILABLE_STATUS: '1'
+          DAILY_SUMMARY_HOUR_IST: '20'
+        run: python monitor.py
+      - name: Save persistent state for next run
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: eco-retreat-state
+          path: state.json
+          retention-days: 30
+          if-no-files-found: error
